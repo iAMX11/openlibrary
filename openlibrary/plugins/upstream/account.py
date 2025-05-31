@@ -2,6 +2,7 @@ import json
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
+from enum import Enum
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import urlparse
@@ -11,7 +12,6 @@ import web
 
 import infogami.core.code as core  # noqa: F401 side effects may be needed
 from infogami import config
-from infogami.infobase.client import ClientException
 from infogami.utils import delegate
 from infogami.utils.view import (
     add_flash_message,
@@ -41,8 +41,9 @@ from openlibrary.core.observations import Observations
 from openlibrary.core.ratings import Ratings
 from openlibrary.i18n import gettext as _
 from openlibrary.plugins import openlibrary as olib
+from openlibrary.plugins.openlibrary.pd import get_pd_options, get_pd_org
 from openlibrary.plugins.recaptcha import recaptcha
-from openlibrary.plugins.upstream import borrow, forms, utils
+from openlibrary.plugins.upstream import borrow, forms
 from openlibrary.plugins.upstream.mybooks import MyBooksTemplate
 from openlibrary.utils.dateutil import elapsed_time
 
@@ -56,9 +57,7 @@ USERNAME_RETRIES = 3
 RESULTS_PER_PAGE: Final = 25
 
 # XXX: These need to be cleaned up
-send_verification_email = accounts.send_verification_email
 create_link_doc = accounts.create_link_doc
-sendmail = accounts.sendmail
 
 
 def get_login_error(error_key):
@@ -280,7 +279,7 @@ class account_create(delegate.page):
 
     def GET(self):
         f = self.get_form()
-        return render['account/create'](f)
+        return render['account/create'](f, pd_options=get_pd_options())
 
     def get_form(self) -> forms.RegisterForm:
         f = forms.Register()
@@ -320,7 +319,7 @@ class account_create(delegate.page):
                 `ml_updates`
                 """  # nopep8
                 mls = ['ml_best_of', 'ml_updates']
-                notifications = mls if f.ia_newsletter.checked else []
+                notifications = mls if "ia_newsletter" in web.input() else []
                 InternetArchiveAccount.create(
                     screenname=f.username.value,
                     email=f.email.value,
@@ -329,6 +328,8 @@ class account_create(delegate.page):
                     verified=False,
                     retries=USERNAME_RETRIES,
                 )
+                if "pd_request" in web.input() and web.input().get("pd_program"):
+                    web.setcookie("pda", web.input().get("pd_program"))
                 return render['account/verify'](
                     username=f.username.value, email=f.email.value
                 )
@@ -340,10 +341,60 @@ class account_create(delegate.page):
                     extra = {'response': e.response} if hasattr(e, 'response') else None
                     sentry.capture_exception(e, extras=extra)
 
-        return render['account/create'](f)
+        return render['account/create'](f, pd_options=get_pd_options())
 
 
 del delegate.pages['/account/register']
+
+
+def _set_account_cookies(ol_account: OpenLibraryAccount, expires: int | str) -> None:
+    if ol_account.get_user().get_safe_mode() == 'yes':
+        web.setcookie('sfw', 'yes', expires=expires)
+    if 'yrg_banner_pref' in ol_account.get_user().preferences():
+        web.setcookie(
+            ol_account.get_user().preferences()['yrg_banner_pref'],
+            '1',
+            expires=(3600 * 24 * 365),
+        )
+
+
+class PDRequestStatus(Enum):
+    REQUESTED = 0
+    EMAILED = 1
+
+
+def _update_account_for_pd(ol_account: OpenLibraryAccount) -> None:
+    pda = web.cookies().get("pda")
+    ol_account.get_user().save_preferences(
+        {
+            "rpd": PDRequestStatus.REQUESTED.value,
+            "pda": pda,
+        }
+    )
+
+
+def _notify_on_rpd_verification(ol_account, org):
+    if org:
+        org = "vtmas_disabilityresources" if org == "unqualified" else org
+        displayname = web.safestr(ol_account.displayname)
+        msg = render_template(
+            "email/account/pd_request", displayname=displayname, org=org
+        )
+        web.sendmail(
+            config.from_address,
+            ol_account.email,
+            subject=msg.subject.strip(),
+            message=msg,
+        )
+        ol_account.get_user().save_preferences(
+            {
+                "rpd": PDRequestStatus.EMAILED.value,
+            }
+        )
+
+
+def _expire_pd_cookies():
+    web.setcookie("pda", "", expires=1)
 
 
 class account_login_json(delegate.page):
@@ -387,19 +438,18 @@ class account_login_json(delegate.page):
             expires = 3600 * 24 * 365 if remember.lower() == 'true' else ""
             web.setcookie('pd', int(audit.get('special_access')) or '', expires=expires)
             web.setcookie(config.login_cookie_name, web.ctx.conn.get_auth_token())
-            if audit.get('ia_email'):
-                ol_account = OpenLibraryAccount.get(email=audit['ia_email'])
-                if ol_account and ol_account.get_user().get_safe_mode() == 'yes':
-                    web.setcookie('sfw', 'yes', expires=expires)
-                if (
-                    ol_account
-                    and 'yrg_banner_pref' in ol_account.get_user().preferences()
-                ):
-                    web.setcookie(
-                        ol_account.get_user().preferences()['yrg_banner_pref'],
-                        '1',
-                        expires=(3600 * 24 * 365),
+            if audit.get('ia_email') and (
+                ol_account := OpenLibraryAccount.get(email=audit['ia_email'])
+            ):
+                _set_account_cookies(ol_account, expires)
+
+                if web.cookies().get("pda"):
+                    _update_account_for_pd(ol_account)
+                    _notify_on_rpd_verification(
+                        ol_account, get_pd_org(web.cookies().get("pda"))
                     )
+                    _expire_pd_cookies()
+
         # Fallback to infogami user/pass
         else:
             from infogami.plugins.api.code import login as infogami_login
@@ -484,15 +534,25 @@ class account_login(delegate.page):
         web.setcookie(
             config.login_cookie_name, web.ctx.conn.get_auth_token(), expires=expires
         )
-        ol_account = OpenLibraryAccount.get(email=email)
-        if ol_account and ol_account.get_user().get_safe_mode() == 'yes':
-            web.setcookie('sfw', 'yes', expires=expires)
-        if ol_account and 'yrg_banner_pref' in ol_account.get_user().preferences():
-            web.setcookie(
-                ol_account.get_user().preferences()['yrg_banner_pref'],
-                '1',
-                expires=(3600 * 24 * 365),
-            )
+
+        if ol_account := OpenLibraryAccount.get(email=email):
+            _set_account_cookies(ol_account, expires)
+
+            if web.cookies().get("pda"):
+                _update_account_for_pd(ol_account)
+                _notify_on_rpd_verification(
+                    ol_account, get_pd_org(web.cookies().get("pda"))
+                )
+                _expire_pd_cookies()
+                add_flash_message(
+                    "info",
+                    _(
+                        "Thank you for registering an Open Library account and "
+                        "requesting special print disability access. You should receive "
+                        "an email detailing next steps in the process."
+                    ),
+                )
+
         blacklist = [
             "/account/login",
             "/account/create",
@@ -506,24 +566,6 @@ class account_login(delegate.page):
             i.redirect = "/account/books"
         stats.increment('ol.account.xauth.login')
         raise web.seeother(i.redirect)
-
-    def POST_resend_verification_email(self, i):
-        try:
-            ol_login = OpenLibraryAccount.authenticate(i.email, i.password)
-        except ClientException as e:
-            code = e.get_data().get("code")
-            if code != "account_not_verified":
-                return self.error("account_incorrect_password", i)
-
-        account = OpenLibraryAccount.get(email=i.email)
-        account.send_verification_email()
-
-        title = _("Hi, %(user)s", user=account.displayname)
-        message = _(
-            "We've sent the verification email to %(email)s. You'll need to read that and click on the verification link to verify your email.",
-            email=account.email,
-        )
-        return render.message(title, message)
 
 
 class account_logout(delegate.page):
@@ -541,58 +583,6 @@ class account_logout(delegate.page):
         from infogami.core.code import logout as infogami_logout
 
         return infogami_logout().POST()
-
-
-class account_verify(delegate.page):
-    """Verify user account."""
-
-    path = "/account/verify/([0-9a-f]*)"
-
-    def GET(self, code):
-        docs = web.ctx.site.store.values(type="account-link", name="code", value=code)
-        if docs:
-            doc = docs[0]
-
-            account = accounts.find(username=doc['username'])
-            if account and account['status'] != "pending":
-                return render['account/verify/activated'](account)
-            account.activate()
-            user = web.ctx.site.get("/people/" + doc['username'])  # TBD
-            return render['account/verify/success'](account)
-        else:
-            return render['account/verify/failed']()
-
-    def POST(self, code=None):
-        """Called to regenerate account verification code."""
-        i = web.input(email=None)
-        account = accounts.find(email=i.email)
-        if not account:
-            return render_template("account/verify/failed", email=i.email)
-        elif account['status'] != "pending":
-            return render['account/verify/activated'](account)
-        else:
-            account.send_verification_email()
-            title = _("Hi, %(user)s", user=account.displayname)
-            message = _(
-                "We've sent the verification email to %(email)s. You'll need to read that and click on the verification link to verify your email.",
-                email=account.email,
-            )
-            return render.message(title, message)
-
-
-class account_verify_old(account_verify):
-    """Old account verification code.
-
-    This takes username, email and code as url parameters. The new one takes just the code as part of the url.
-    """
-
-    path = "/account/verify"
-
-    def GET(self):
-        # It is too long since we switched to the new account verification links.
-        # All old links must be expired by now.
-        # Show failed message without thinking.
-        return render['account/verify/failed']()
 
 
 class account_validation(delegate.page):
@@ -671,16 +661,6 @@ class account_email_verify(delegate.page):
         return render.message(title, message)
 
 
-class account_email_verify_old(account_email_verify):
-    path = "/account/email/verify"
-
-    def GET(self):
-        # It is too long since we switched to the new email verification links.
-        # All old links must be expired by now.
-        # Show failed message without thinking.
-        return self.bad_link()
-
-
 class account_ia_email_forgot(delegate.page):
     path = "/account/email/forgot-ia"
 
@@ -709,59 +689,6 @@ class account_ia_email_forgot(delegate.page):
         else:
             err = "Please enter a valid Open Library email"
         return render_template('account/email/forgot-ia', err=err)
-
-
-class account_password_forgot(delegate.page):
-    path = "/account/password/forgot"
-
-    def GET(self):
-        f = forms.ForgotPassword()
-        return render['account/password/forgot'](f)
-
-    def POST(self):
-        i = web.input(email='')
-
-        f = forms.ForgotPassword()
-
-        if not f.validates(i):
-            return render['account/password/forgot'](f)
-
-        account = accounts.find(email=i.email)
-
-        if account.is_blocked():
-            f.note = utils.get_error("account_blocked")
-            return render_template('account/password/forgot', f)
-
-        send_forgot_password_email(account.username, i.email)
-        return render['account/password/sent'](i.email)
-
-
-class account_password_reset(delegate.page):
-    path = "/account/password/reset/([0-9a-f]*)"
-
-    def GET(self, code):
-        docs = web.ctx.site.store.values(type="account-link", name="code", value=code)
-        if not docs:
-            title = _("Password reset failed.")
-            message = "Your password reset link seems invalid or expired."
-            return render.message(title, message)
-
-        f = forms.ResetPassword()
-        return render['account/password/reset'](f)
-
-    def POST(self, code):
-        link = accounts.get_link(code)
-        if not link:
-            title = _("Password reset failed.")
-            message = "The password reset link seems invalid or expired."
-            return render.message(title, message)
-
-        username = link['username']
-        i = web.input()
-
-        accounts.update_account(username, password=i.password)
-        link.delete()
-        return render_template("account/password/reset_success", username=username)
 
 
 class account_audit(delegate.page):
@@ -1239,19 +1166,6 @@ class account_waitlist(delegate.page):
 #
 #     def GET(self, path):
 #         return render.notfound(path, create=False)
-
-
-def send_forgot_password_email(username: str, email: str) -> None:
-    key = f"account/{username}/password"
-
-    doc = create_link_doc(key, username, email)
-    web.ctx.site.store[key] = doc
-
-    link = web.ctx.home + "/account/password/reset/" + doc['code']
-    msg = render_template(
-        "email/password/reminder", username=username, email=email, link=link
-    )
-    sendmail(email, msg)
 
 
 def as_admin(f):
