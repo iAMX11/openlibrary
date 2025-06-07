@@ -1,3 +1,6 @@
+# ruff: noqa: RUF012
+# See https://github.com/internetarchive/openlibrary/pull/10283#issuecomment-2940908216
+
 import logging
 import re
 import sys
@@ -173,6 +176,7 @@ class WorkSearchScheme(SearchScheme):
         'title',
         'subtitle',
         'edition_count',
+        'ebook_access',
         'ia',
         'has_fulltext',
         'first_publish_year',
